@@ -469,6 +469,25 @@ class BookWalkerService {
     norm = norm.replaceAll(RegExp(r'\(.*?(?:特典|限定|小冊子|フェア).*?\)'), '');
     norm = norm.replaceAll(RegExp(r'（.*?(?:特典|限定|小冊子|フェア).*?）'), '');
 
+    // Normalize number followed by period punctuation (e.g. "28.魔女の誘惑" -> "28 魔女の誘惑")
+    // When dot is NOT followed by a digit, it is punctuation, not a decimal!
+    norm = norm.replaceAllMapped(RegExp(r'(\d+)\.(?!\d)'), (m) => '${m[1]} ');
+
+    // Calculate arc accumulation offset (e.g. Classroom of the Elite 實力至上主義的教室)
+    double arcOffset = 0.0;
+    final isClassroom = baseTitle.contains('実力至上主義') ||
+        baseTitle.contains('實力至上主義') ||
+        text.contains('実力至上主義') ||
+        text.contains('實力至上主義');
+
+    if (isClassroom) {
+      if (norm.contains('2年生') || norm.contains('2年級') || norm.contains('二年級')) {
+        arcOffset = 11.0; // 11 mainline volumes in 1st year (1-11)
+      } else if (norm.contains('3年生') || norm.contains('3年級') || norm.contains('三年級')) {
+        arcOffset = 23.0; // 11 (1st year) + 12 (2nd year) = 23
+      }
+    }
+
     // Strip baseTitle to prevent numbers in the title (e.g. "86") from matching
     var stripped = norm;
     if (baseTitle.isNotEmpty) {
@@ -483,6 +502,7 @@ class BookWalkerService {
 
     // Strip arc markers (e.g. 2年生編, ２年級篇, 第2部, 2nd season)
     stripped = stripped.replaceAll(RegExp(r'\d+\s*(?:年生編|年生|年級篇|年級|期|部|章)', caseSensitive: false), '');
+    stripped = stripped.replaceAllMapped(RegExp(r'(\d+)\.(?!\d)'), (m) => '${m[1]} ');
 
     // Re-strip any stray years in stripped string
     stripped = stripped.replaceAll(RegExp(r'(?:19|20)\d{2}\s*年?'), '');
@@ -490,8 +510,9 @@ class BookWalkerService {
 
     // Helper validator: light novel volumes are never >= 150
     double sanitizeVol(double v) {
-      if (v <= 0.0 || v >= 150.0) return 0.0;
-      return v;
+      final finalV = v + arcOffset;
+      if (finalV <= 0.0 || finalV >= 150.0) return 0.0;
+      return finalV;
     }
 
     // 1. Explicit volume markers in stripped text: Ep.14 / Ep 14 / 第4.5卷 / Vol.7.5

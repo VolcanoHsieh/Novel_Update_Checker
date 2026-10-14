@@ -1,5 +1,6 @@
 import 'package:dio/dio.dart';
 import 'package:html/parser.dart' as html_parser;
+import 'log_service.dart';
 
 class RemoteBookResult {
   final double latestVol;
@@ -24,6 +25,10 @@ class BookWalkerService {
               headers: {
                 'User-Agent':
                     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept':
+                    'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+                'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7,ja;q=0.6',
+                'Referer': 'https://www.bookwalker.com.tw/',
               },
               connectTimeout: const Duration(seconds: 12),
               receiveTimeout: const Duration(seconds: 12),
@@ -113,10 +118,95 @@ class BookWalkerService {
         lower.contains('comic');
   }
 
+  /// Check if an item is a pre-order / reservation (預購 / 予約) rather than published
+  static bool isPreorderItem(String title, {String label = '', String text = ''}) {
+    final lowerTitle = title.toLowerCase();
+    final lowerLabel = label.toLowerCase();
+    final lowerText = text.toLowerCase();
+
+    // Title markers for pre-orders
+    if (lowerTitle.contains('【預購】') ||
+        lowerTitle.contains('[預購]') ||
+        lowerTitle.contains('(預購)') ||
+        lowerTitle.contains('（預購）') ||
+        lowerTitle.contains('【預約】') ||
+        lowerTitle.contains('[預約]') ||
+        lowerTitle.contains('(預約)') ||
+        lowerTitle.contains('（預約）') ||
+        lowerTitle.contains('【予約】') ||
+        lowerTitle.contains('[予約]') ||
+        lowerTitle.contains('(予約)') ||
+        lowerTitle.contains('（予約）') ||
+        lowerTitle.contains('予約受付中') ||
+        lowerTitle.contains('預購商品')) {
+      return true;
+    }
+
+    // Label or badge markers
+    if (lowerLabel.contains('予約') ||
+        lowerLabel.contains('預購') ||
+        lowerLabel.contains('預約') ||
+        lowerLabel.contains('配信予定') ||
+        lowerLabel.contains('即將上市') ||
+        lowerLabel.contains('即將出版')) {
+      return true;
+    }
+
+    // Card content markers
+    if (lowerText.contains('予約受付') ||
+        lowerText.contains('予約する') ||
+        lowerText.contains('預購中') ||
+        lowerText.contains('配信予定日') ||
+        lowerText.contains('尚未上市')) {
+      return true;
+    }
+
+    return false;
+  }
+
   /// Search BookWalker Taiwan for latest volume of light novel
-  Future<RemoteBookResult?> searchTaiwan(String title) async {
+  Future<RemoteBookResult?> searchTaiwan(String title, {String? targetUrl}) async {
+    final cleanTitle = _cleanTitle(title);
+
+    // 1. If targetUrl is explicitly provided (e.g. series URL or product URL)
+    if (targetUrl != null && targetUrl.trim().isNotEmpty) {
+      final trimmedUrl = targetUrl.trim();
+      try {
+        if (trimmedUrl.contains('/product/')) {
+          final res = await _dio.get(trimmedUrl);
+          if (res.statusCode == 200 && res.data != null) {
+            final doc = html_parser.parse(res.data);
+            final ogTitle = doc.querySelector('meta[property="og:title"]')?.attributes['content'] ??
+                doc.querySelector('h1, .book-title, title')?.text.trim() ?? '';
+            final pTitle = ogTitle.split('線上看').first.trim();
+            final vol = _extractVolume(pTitle, baseTitle: cleanTitle);
+            return RemoteBookResult(
+              latestVol: vol > 0.0 ? vol : 1.0,
+              title: pTitle.isNotEmpty ? pTitle : cleanTitle,
+              url: trimmedUrl,
+            );
+          }
+        } else if (trimmedUrl.contains('series=') || trimmedUrl.contains('/search')) {
+          final res = await _dio.get(trimmedUrl);
+          if (res.statusCode == 200 && res.data != null) {
+            final parsed = _parseTaiwanBookList(
+              res.data,
+              cleanTitle,
+              defaultUrl: trimmedUrl,
+              isSeriesUrl: trimmedUrl.contains('series='),
+            );
+            if (parsed != null) return parsed;
+          }
+        }
+      } catch (_) {
+        // Fall back to keyword search on error
+      }
+    }
+
+    if (cleanTitle.isEmpty) return null;
+
+    // 2. Keyword search on BookWalker Taiwan
     try {
-      final cleanTitle = _cleanTitle(title);
       final response = await _dio.get(
         'https://www.bookwalker.com.tw/search',
         queryParameters: {
@@ -129,73 +219,129 @@ class BookWalkerService {
         return null;
       }
 
-      final doc = html_parser.parse(response.data);
-      final bookBoxes = doc.querySelectorAll('.bookbox, .bookitem, .bookinfo, li.item, div[class*="book"]');
+      return _parseTaiwanBookList(response.data, cleanTitle);
+    } catch (_) {
+      // Ignore network errors
+    }
+    return null;
+  }
 
-      double maxVol = 0.0;
-      String bestTitle = '';
-      String bestUrl = '';
+  RemoteBookResult? _parseTaiwanBookList(
+    dynamic responseData,
+    String cleanTitle, {
+    String? defaultUrl,
+    bool isSeriesUrl = false,
+  }) {
+    final doc = html_parser.parse(responseData);
+    final bookBoxes = doc.querySelectorAll('.bookbox, .bookitem, .bookinfo, li.item, div[class*="book"]');
 
-      // First pass: inspect structured book items with category labels
-      for (final box in bookBoxes) {
-        final catLabel = box.querySelector('.cat-label, .category, .tag')?.text.trim() ?? '';
-        // Strictly reject if marked as comic
-        if (catLabel.contains('漫畫') || catLabel.contains('漫画')) {
+    double maxVol = 0.0;
+    String bestTitle = '';
+    String bestUrl = '';
+    int matchedCount = 0;
+    String firstMatchedTitle = '';
+    String firstMatchedUrl = '';
+
+    final matchKey = cleanTitle.length > 3 ? cleanTitle.substring(0, 3) : cleanTitle;
+
+    // First pass: inspect structured book items
+    for (final box in bookBoxes) {
+      final catLabel = box.querySelector('.cat-label, .category, .tag, .lablename')?.text.trim() ?? '';
+      // Strictly reject if marked as comic
+      if (catLabel.contains('漫畫') || catLabel.contains('漫画')) {
+        continue;
+      }
+
+      final a = box.querySelector('a.gtag-click, h2.bookname a, h4.bookname a, .bookname a, a[title]') ??
+          box.querySelector('a');
+      final itemTitle = a?.attributes['title'] ??
+          box.querySelector('.bookname')?.text.trim() ??
+          box.querySelector('img')?.attributes['alt'] ??
+          a?.text.trim() ??
+          '';
+      var href = a?.attributes['href'] ?? '';
+
+      if (itemTitle.isEmpty || href.isEmpty || href == '#') continue;
+      if (isIrrelevantItem(itemTitle, href) || isComicItem(itemTitle)) continue;
+
+      if (isPreorderItem(itemTitle, label: catLabel, text: box.text)) {
+        LogService.instance.info('BookWalker TW', '[$cleanTitle] 排除預購商品: $itemTitle');
+        continue;
+      }
+
+      if (href.startsWith('/')) {
+        href = 'https://www.bookwalker.com.tw$href';
+      }
+
+      // Check title relevance (if not on an explicit series page)
+      if (!isSeriesUrl && matchKey.isNotEmpty && !itemTitle.contains(matchKey)) {
+        continue;
+      }
+
+      matchedCount++;
+      if (firstMatchedTitle.isEmpty) {
+        firstMatchedTitle = itemTitle;
+        firstMatchedUrl = href;
+      }
+
+      final vol = _extractVolume(itemTitle, baseTitle: cleanTitle);
+      if (vol > maxVol) {
+        maxVol = vol;
+        bestTitle = itemTitle;
+        bestUrl = href;
+      }
+    }
+
+    // Fallback pass: all title links if structured parse yielded nothing
+    if (matchedCount == 0 && !isSeriesUrl) {
+      final links = doc.querySelectorAll('a[title]');
+      for (final a in links) {
+        final itemTitle = a.attributes['title'] ?? '';
+        var href = a.attributes['href'] ?? '';
+
+        if (itemTitle.isEmpty || href.isEmpty || href == '#') continue;
+        if (isIrrelevantItem(itemTitle, href) || isComicItem(itemTitle)) continue;
+
+        if (isPreorderItem(itemTitle, text: a.text)) {
+          LogService.instance.info('BookWalker TW', '[$cleanTitle] 排除預購商品: $itemTitle');
           continue;
         }
 
-        final a = box.querySelector('h2.bookname a, .bookname a, a[title]');
-        final itemTitle = a?.attributes['title'] ?? a?.text.trim() ?? '';
-        final href = a?.attributes['href'] ?? '';
+        if (matchKey.isNotEmpty && !itemTitle.contains(matchKey)) continue;
 
-        if (itemTitle.isEmpty || href.isEmpty) continue;
-        if (isIrrelevantItem(itemTitle, href) || isComicItem(itemTitle)) continue;
+        if (href.startsWith('/')) {
+          href = 'https://www.bookwalker.com.tw$href';
+        }
 
-        // Check title relevance (first 3 characters or substring)
-        final matchKey = cleanTitle.length > 3 ? cleanTitle.substring(0, 3) : cleanTitle;
-        if (!itemTitle.contains(matchKey)) {
-          continue;
+        matchedCount++;
+        if (firstMatchedTitle.isEmpty) {
+          firstMatchedTitle = itemTitle;
+          firstMatchedUrl = href;
         }
 
         final vol = _extractVolume(itemTitle, baseTitle: cleanTitle);
         if (vol > maxVol) {
           maxVol = vol;
           bestTitle = itemTitle;
-          bestUrl = href.startsWith('http') ? href : 'https://www.bookwalker.com.tw$href';
+          bestUrl = href;
         }
       }
+    }
 
-      // Fallback pass: all title links if structured parse yielded nothing
-      if (maxVol == 0.0) {
-        final links = doc.querySelectorAll('a[title]');
-        for (final a in links) {
-          final itemTitle = a.attributes['title'] ?? '';
-          final href = a.attributes['href'] ?? '';
+    // Crucial: Single-volume novel handling (本系列僅有一冊)
+    if (maxVol == 0.0 && matchedCount > 0) {
+      maxVol = (matchedCount == 1) ? 1.0 : matchedCount.toDouble();
+      bestTitle = bestTitle.isNotEmpty ? bestTitle : firstMatchedTitle;
+      bestUrl = bestUrl.isNotEmpty ? bestUrl : firstMatchedUrl;
+    }
 
-          if (itemTitle.isEmpty || href.isEmpty) continue;
-          if (isIrrelevantItem(itemTitle, href) || isComicItem(itemTitle)) continue;
-
-          final matchKey = cleanTitle.length > 3 ? cleanTitle.substring(0, 3) : cleanTitle;
-          if (!itemTitle.contains(matchKey)) continue;
-
-          final vol = _extractVolume(itemTitle, baseTitle: cleanTitle);
-          if (vol > maxVol) {
-            maxVol = vol;
-            bestTitle = itemTitle;
-            bestUrl = href.startsWith('http') ? href : 'https://www.bookwalker.com.tw$href';
-          }
-        }
-      }
-
-      if (maxVol > 0.0) {
-        return RemoteBookResult(
-          latestVol: maxVol,
-          title: bestTitle,
-          url: bestUrl,
-        );
-      }
-    } catch (_) {
-      // Ignore network errors
+    if (maxVol > 0.0) {
+      LogService.instance.debug('BookWalker TW', '[$cleanTitle] 解析成功: 最新卷數=$maxVol, 標題=$bestTitle');
+      return RemoteBookResult(
+        latestVol: maxVol,
+        title: bestTitle.isNotEmpty ? bestTitle : cleanTitle,
+        url: bestUrl.isNotEmpty ? bestUrl : (defaultUrl ?? ''),
+      );
     }
     return null;
   }
@@ -213,19 +359,48 @@ class BookWalkerService {
   }
 
   /// Search BookWalker Japan for latest volume of light novel
-  Future<RemoteBookResult?> searchJapan(String jpTitle) async {
+  Future<RemoteBookResult?> searchJapan(String jpTitle, {String? targetUrl}) async {
     final cleanTitle = _cleanTitle(jpTitle);
     if (cleanTitle.isEmpty) return null;
 
-    // 1. Try with genre=2 (Light Novel)
+    // 1. If targetUrl is explicitly provided (e.g. series URL or detail page)
+    if (targetUrl != null && targetUrl.trim().isNotEmpty) {
+      final direct = cleanUrl(targetUrl.trim());
+      try {
+        if (direct.contains('/series/')) {
+          final res = await _parseJapanSeriesPage(direct, cleanTitle);
+          if (res != null) return res;
+        } else if (direct.contains('/de')) {
+          final res = await _dio.get(direct);
+          if (res.statusCode == 200 && res.data != null) {
+            final doc = html_parser.parse(res.data);
+            final title = normalizeFullWidth(
+              doc.querySelector('h1, .p-main__title, meta[property="og:title"]')?.text.trim() ??
+                  doc.querySelector('meta[property="og:title"]')?.attributes['content'] ??
+                  cleanTitle,
+            );
+            final vol = _extractVolume(title, baseTitle: cleanTitle);
+            return RemoteBookResult(
+              latestVol: vol > 0.0 ? vol : 1.0,
+              title: title.isNotEmpty ? title : cleanTitle,
+              url: direct,
+            );
+          }
+        }
+      } catch (_) {
+        // Fall back to keyword search
+      }
+    }
+
+    // 2. Try with genre=2 (Light Novel)
     var result = await _executeJapanSearch(cleanTitle, genre: '2');
     if (result != null) return result;
 
-    // 2. Try without genre filter (for Shinbungei / Tankobon like GA Novel, Kadokawa Books)
+    // 3. Try without genre filter (for Shinbungei / Tankobon like GA Novel, Kadokawa Books)
     result = await _executeJapanSearch(cleanTitle);
     if (result != null) return result;
 
-    // 3. Fallback: Try with root title (strip subtitle like 〜, ～, :, -)
+    // 4. Fallback: Try with root title (strip subtitle like 〜, ～, :, -)
     final rootTitle = cleanTitle.split(RegExp(r'[〜～:：―\-]')).first.trim();
     if (rootTitle.isNotEmpty && rootTitle != cleanTitle && rootTitle.length >= 2) {
       result = await _executeJapanSearch(rootTitle, genre: '2');
@@ -235,7 +410,7 @@ class BookWalkerService {
       if (result != null) return result;
     }
 
-    // 4. Fallback: Check Japanese Wikipedia if BookWalker has no volume data
+    // 5. Fallback: Check Japanese Wikipedia if BookWalker has no volume data
     return await fetchJaWikipediaVolume(cleanTitle);
   }
 
@@ -297,11 +472,17 @@ class BookWalkerService {
       for (final item in items) {
         final img = item.querySelector('img');
         final alt = img?.attributes['alt'] ?? '';
-        final titleA = item.querySelector('.m-book-item__title a, a');
+        final titleA = item.querySelector('p.m-book-item__title a, a.m-book-item__title, a.m-thumb__image, .m-book-item__title a') ??
+            item.querySelector('a:not(.m-thumb__check)');
         final rawHref = titleA?.attributes['href'] ?? '';
         final label = item.querySelector('.m-book-item__label')?.text.trim() ?? '';
 
         if (isIrrelevantItem(alt, rawHref) || isComicItem(alt) || label.contains('コミック')) {
+          continue;
+        }
+
+        if (isPreorderItem(alt, label: label, text: item.text)) {
+          LogService.instance.info('BookWalker JP', '[$cleanTitle] 排除預購系列/書籍: $alt');
           continue;
         }
 
@@ -344,14 +525,24 @@ class BookWalkerService {
       double maxVol = 0.0;
       String bestTitle = '';
       String bestUrl = '';
+      int matchedCount = 0;
+      String firstMatchedTitle = '';
+      String firstMatchedUrl = '';
 
       for (final item in items) {
         final img = item.querySelector('img');
         final title = normalizeFullWidth(img?.attributes['alt'] ?? '');
-        final a = item.querySelector('.m-book-item__title a, a');
+        final a = item.querySelector('p.m-book-item__title a, a.m-book-item__title, a.m-thumb__image, .m-book-item__title a') ??
+            item.querySelector('a:not(.m-thumb__check)');
         final rawHref = a?.attributes['href'] ?? '';
 
         if (title.isEmpty || isIrrelevantItem(title, rawHref) || isComicItem(title)) {
+          continue;
+        }
+
+        final label = item.querySelector('.m-book-item__label, .m-thumb__label-area, .m-book-item__status-tag')?.text.trim() ?? '';
+        if (isPreorderItem(title, label: label, text: item.text)) {
+          LogService.instance.info('BookWalker JP', '[$cleanTitle] 排除預購商品: $title');
           continue;
         }
 
@@ -368,6 +559,12 @@ class BookWalkerService {
           continue;
         }
 
+        matchedCount++;
+        if (firstMatchedTitle.isEmpty) {
+          firstMatchedTitle = title;
+          firstMatchedUrl = directHref;
+        }
+
         final vol = _extractVolume(title, baseTitle: cleanTitle);
         if (vol > 0.0 && vol < 150.0 && vol > maxVol) {
           maxVol = vol;
@@ -376,15 +573,23 @@ class BookWalkerService {
         }
       }
 
+      // Single-volume fallback
+      if (maxVol == 0.0 && matchedCount > 0) {
+        maxVol = matchedCount == 1 ? 1.0 : matchedCount.toDouble();
+        bestTitle = bestTitle.isNotEmpty ? bestTitle : firstMatchedTitle;
+        bestUrl = bestUrl.isNotEmpty ? bestUrl : firstMatchedUrl;
+      }
+
       if (maxVol > 0.0) {
+        LogService.instance.debug('BookWalker JP', '[$cleanTitle] 解析成功: 最新卷數=$maxVol, 標題=$bestTitle');
         return RemoteBookResult(
           latestVol: maxVol,
           title: bestTitle,
           url: bestUrl,
         );
       }
-    } catch (_) {
-      // Ignore network errors
+    } catch (e, s) {
+      LogService.instance.warn('BookWalker JP', '搜尋日版失敗: $cleanTitle', error: e);
     }
     return null;
   }
@@ -405,6 +610,9 @@ class BookWalkerService {
       double maxVol = 0.0;
       String bestTitle = '';
       String bestUrl = cleanUrl(seriesUrl);
+      int matchedCount = 0;
+      String firstMatchedTitle = '';
+      String firstMatchedUrl = '';
 
       for (final item in items) {
         final title = normalizeFullWidth(
@@ -412,16 +620,29 @@ class BookWalkerService {
           item.querySelector('.a-tile-ttl')?.text ??
           item.querySelector('.m-book-item__title a')?.text.trim() ?? ''
         );
-        final a = item.querySelector('.m-book-item__title a, a');
+        final a = item.querySelector('p.m-book-item__title a, a.m-book-item__title, a.m-thumb__image, .m-book-item__title a') ??
+            item.querySelector('a:not(.m-thumb__check)');
         final rawHref = a?.attributes['href'] ?? '';
 
         if (title.isEmpty || isIrrelevantItem(title, rawHref) || isComicItem(title)) {
           continue;
         }
 
+        final label = item.querySelector('.m-book-item__label, .m-thumb__label-area, .m-book-item__status-tag')?.text.trim() ?? '';
+        if (isPreorderItem(title, label: label, text: item.text)) {
+          LogService.instance.info('BookWalker JP', '[$cleanTitle] 排除預購系列作品: $title');
+          continue;
+        }
+
         final directHref = cleanUrl(rawHref);
         if (directHref.isNotEmpty && !directHref.contains('/de') && !directHref.contains('/series/')) {
           continue;
+        }
+
+        matchedCount++;
+        if (firstMatchedTitle.isEmpty) {
+          firstMatchedTitle = title;
+          firstMatchedUrl = directHref;
         }
 
         final vol = _extractVolume(title, baseTitle: cleanTitle);
@@ -435,16 +656,18 @@ class BookWalkerService {
       }
 
       // If books in series have parsed volume numbers (e.g. Ep.14), use maxVol!
-      // Only fall back to seriesCardCount if NO volumes were extracted at all
+      // Only fall back to seriesCardCount or matchedCount if NO volumes were extracted at all
       final finalVol = maxVol > 0.0
           ? maxVol
-          : (seriesCardCount > 0 && seriesCardCount < 150 ? seriesCardCount.toDouble() : 0.0);
+          : (seriesCardCount > 0 && seriesCardCount < 150
+              ? seriesCardCount.toDouble()
+              : (matchedCount > 0 ? (matchedCount == 1 ? 1.0 : matchedCount.toDouble()) : 0.0));
 
       if (finalVol > 0.0) {
         return RemoteBookResult(
           latestVol: finalVol,
-          title: bestTitle.isNotEmpty ? bestTitle : cleanTitle,
-          url: bestUrl,
+          title: bestTitle.isNotEmpty ? bestTitle : (firstMatchedTitle.isNotEmpty ? firstMatchedTitle : cleanTitle),
+          url: bestUrl.isNotEmpty ? bestUrl : (firstMatchedUrl.isNotEmpty ? firstMatchedUrl : cleanUrl(seriesUrl)),
         );
       }
     } catch (_) {}
@@ -513,6 +736,11 @@ class BookWalkerService {
       final finalV = v + arcOffset;
       if (finalV <= 0.0 || finalV >= 150.0) return 0.0;
       return finalV;
+    }
+
+    // 0. Single volume marker: (全), （全）, [全], 全一冊, 全1冊
+    if (RegExp(r'[\(（\[]全(?:一[卷冊集]|1[卷冊集])?[\)）\]]|(?<!\w)全一[卷冊集]|(?<!\w)全1[卷冊集]').hasMatch(norm)) {
+      return 1.0;
     }
 
     // 1. Explicit volume markers in stripped text: Ep.14 / Ep 14 / 第4.5卷 / Vol.7.5

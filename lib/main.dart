@@ -1,10 +1,22 @@
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:window_manager/window_manager.dart';
+import 'services/cache_service.dart';
+import 'services/log_service.dart';
 import 'ui/main_screen.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // Initialize logging service with app data directory
+  try {
+    final cacheService = CacheService();
+    final dataDir = await cacheService.dataDirectory;
+    await LogService.instance.init(dataDir);
+    LogService.instance.info('App', '文庫輕小說追更檢查器啟動');
+  } catch (e) {
+    debugPrint('LogService init error: $e');
+  }
 
   // Desktop window configuration
   if (Platform.isWindows || Platform.isMacOS || Platform.isLinux) {

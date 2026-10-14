@@ -4,6 +4,7 @@ import '../models/book_item.dart';
 import 'bangumi_service.dart';
 import 'bookwalker_service.dart';
 import 'cache_service.dart';
+import 'log_service.dart';
 
 class UpdateCheckerService {
   final BangumiService bangumiService;
@@ -31,6 +32,7 @@ class UpdateCheckerService {
   Future<void> checkSingleBook(BookItem book, AppConfig config, {bool force = false}) async {
     book.status = UpdateStatus.checking;
     book.statusMessage = '正在查詢中...';
+    LogService.instance.info('Checker', '開始查詢 [${book.title}] (本地最大卷: ${book.localMaxVol})');
 
     try {
       BangumiSubject? bgmSubject;
@@ -46,12 +48,13 @@ class UpdateCheckerService {
           if (bgmSubject.id > 0) {
             book.bangumiId = bgmSubject.id;
           }
+          LogService.instance.info('Checker', '[${book.title}] 取得日文書名: ${book.jpTitle}');
         }
       }
 
       // 2. BookWalker Taiwan
       if (config.checkTw) {
-        final twResult = await bookWalkerService.searchTaiwan(book.title);
+        final twResult = await bookWalkerService.searchTaiwan(book.title, targetUrl: book.twUrl);
         if (twResult != null) {
           book.twLatestVol = twResult.latestVol;
           book.twLatestTitle = twResult.title;
@@ -66,7 +69,7 @@ class UpdateCheckerService {
             : book.title;
 
         // Source 1: BookWalker Japan
-        final jpResult = await bookWalkerService.searchJapan(queryJp);
+        final jpResult = await bookWalkerService.searchJapan(queryJp, targetUrl: book.jpUrl);
         if (jpResult != null && jpResult.latestVol > 0) {
           book.jpLatestVol = jpResult.latestVol;
           book.jpLatestTitle = jpResult.title;
@@ -87,9 +90,11 @@ class UpdateCheckerService {
 
       book.lastChecked = DateTime.now();
       book.refreshStatus();
-    } catch (e) {
+      LogService.instance.info('Checker', '[${book.title}] 查詢完成: 狀態=${book.statusMessage ?? book.status.name}, 台版最新=${book.twLatestVol}, 日版最新=${book.jpLatestVol}');
+    } catch (e, stack) {
       book.status = UpdateStatus.error;
       book.statusMessage = '查詢發生錯誤: $e';
+      LogService.instance.error('Checker', '[${book.title}] 查詢發生錯誤: $e', error: e, stackTrace: stack);
     }
   }
 
@@ -115,9 +120,13 @@ class UpdateCheckerService {
 
     int completed = 0;
     final total = targetBooks.length;
+    LogService.instance.info('Checker', '開始批次檢查更新: 共 $total 本書籍待檢查');
 
     for (final book in targetBooks) {
-      if (_isCancelled) break;
+      if (_isCancelled) {
+        LogService.instance.warn('Checker', '使用者取消了更新檢查');
+        break;
+      }
 
       onProgress?.call(completed + 1, total, book);
       await checkSingleBook(book, config, force: force);
@@ -128,7 +137,10 @@ class UpdateCheckerService {
         await cacheService.saveCachedBooks(books);
       }
 
-      if (_isCancelled) break;
+      if (_isCancelled) {
+        LogService.instance.warn('Checker', '使用者取消了更新檢查');
+        break;
+      }
 
       // Rate limit delay
       if (config.requestDelayMs > 0) {
@@ -141,6 +153,7 @@ class UpdateCheckerService {
 
     _isRunning = false;
     _isCancelled = false;
+    LogService.instance.info('Checker', '批次更新檢查全部完成 (已檢查 $completed / $total)');
     onFinished?.call();
   }
 }

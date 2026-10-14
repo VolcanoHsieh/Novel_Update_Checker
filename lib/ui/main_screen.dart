@@ -7,6 +7,7 @@ import '../services/scanner_service.dart';
 import '../services/update_checker_service.dart';
 import 'book_table.dart';
 import 'format_dialog.dart';
+import 'log_dialog.dart';
 import 'stats_cards.dart';
 
 class MainScreen extends StatefulWidget {
@@ -235,6 +236,11 @@ class _MainScreenState extends State<MainScreen> {
           ],
         ),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.receipt_long_outlined),
+            tooltip: '系統日誌 (Log Viewer)',
+            onPressed: () => LogDialog.show(context),
+          ),
           IconButton(
             icon: const Icon(Icons.settings_outlined),
             tooltip: '格式規則與查詢設定',

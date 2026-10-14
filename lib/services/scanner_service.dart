@@ -2,6 +2,7 @@ import 'dart:io';
 import 'package:path/path.dart' as p;
 import '../models/app_config.dart';
 import '../models/book_item.dart';
+import 'log_service.dart';
 
 class ScannerService {
   /// Known top-level category folder names
@@ -91,8 +92,11 @@ class ScannerService {
   }) async {
     final rootDir = Directory(rootPath);
     if (!await rootDir.exists()) {
+      LogService.instance.warn('Scanner', '指定的掃描目錄不存在: $rootPath');
       return [];
     }
+
+    LogService.instance.info('Scanner', '開始掃描目錄: $rootPath');
 
     final RegExp patternRegex = config.compilePatternRegex();
     final supportedExts = config.supportedExtensions.map((e) => e.toLowerCase()).toSet();
@@ -204,6 +208,7 @@ class ScannerService {
 
     // Sort books alphabetically by title
     books.sort((a, b) => a.title.compareTo(b.title));
+    LogService.instance.info('Scanner', '目錄掃描完成: 遍歷 $scannedFiles 個檔案，識別出 ${books.length} 部書籍系列');
     return books;
   }
 

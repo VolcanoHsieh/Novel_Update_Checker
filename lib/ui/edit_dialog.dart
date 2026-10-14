@@ -247,9 +247,17 @@ class _EditDialogState extends State<EditDialog> {
           icon: const Icon(Icons.refresh, size: 16),
           label: const Text('重新線上查詢此書'),
           onPressed: () {
-            // Apply current manual title first
+            // Apply current manual title & URLs first
             if (_jpTitleCtrl.text.trim().isNotEmpty) {
               widget.book.jpTitle = _jpTitleCtrl.text.trim();
+              widget.book.manualOverride = true;
+            }
+            if (_twUrlCtrl.text.trim().isNotEmpty) {
+              widget.book.twUrl = _twUrlCtrl.text.trim();
+              widget.book.manualOverride = true;
+            }
+            if (_jpUrlCtrl.text.trim().isNotEmpty) {
+              widget.book.jpUrl = _jpUrlCtrl.text.trim();
               widget.book.manualOverride = true;
             }
             Navigator.of(context).pop();

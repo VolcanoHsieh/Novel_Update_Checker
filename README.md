@@ -1,6 +1,9 @@
 # novel_update_checker
 
-A new Flutter project.
+Using Flutter 3.44.6 to develop this project.
+
+## Warning! This project is 90% vibe code by Antigravity with Gemini 4 Argon. 
+## Some code is in a really bad quality, please ignore it or try to fix it.
 
 ## Getting Started
 
